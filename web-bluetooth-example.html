@@ -1,0 +1,423 @@
+---
+feature_name: Web Bluetooth
+chrome_version: 55
+check_min_version: true
+feature_id: 5264933985976320
+icon_url: icon.png
+index: index.html
+---
+
+<script type="text/javascript" src="https://cdn.rawgit.com/ricmoo/aes-js/e27b99df/index.js"></script>
+
+
+<img class="pageIcon" src="icon.png">
+<h1>Web Bluetooth / Bozzys Lock Sample</h1>
+<p class="availability">
+    Available in <a target="_blank" href="https://www.chromestatus.com/feature/5264933985976320">Chrome 55+</a> |
+    <a target="_blank" href="https://github.com/rezreal/bozzys/web-bluetooth-example.html">View on GitHub</a>
+</p>
+<p>The <a href="https://developers.google.com/web/updates/2015/07/interact-with-ble-devices-on-the-web">Web Bluetooth
+    API</a> lets websites discover and communicate with devices over the
+    Bluetooth 4 wireless standard using the Generic Attribute Profile (GATT). It is
+    currently partially implemented in Android M, Chrome OS, Linux, and Mac.</p>
+
+<p>This sample illustrates the use of the Web Bluetooth API to interact with the Bozzys Lock.</p>
+
+<label>Password: <input id="password" type="text" pattern="\d{6}" value="123412"/></label>
+<br/>
+<button id="pair">Pair with Lock</button>
+
+<form>
+    <fieldset>
+        <legend>Status</legend>
+        <label for="battery_level">Battery Level</label>
+        <progress id="battery_level" value="0" max="100"></progress>
+        <input id="battery_level_text" disabled/>
+
+
+        <br/>
+        <button type="button" id="open" disabled="disabled">Open</button>
+        <button type="button" id="close" disabled="disabled">Close</button>
+    </fieldset>
+    <fieldset id="actionsFieldset" disabled>
+        <legend>Actions</legend>
+        <label for="force_open">
+            <button type="button" id="force_open">Force Open</button>
+        </label>
+        <label for="force_close">
+            <button type="button" id="force_close">Force Close</button>
+        </label>
+        <label for="set_auto_open_true">
+            <button type="button" id="set_auto_open_true">Open when connected</button>
+        </label>
+        <label for="set_auto_open_false">
+            <button type="button" id="set_auto_open_false">Not open when connected</button>
+        </label>
+
+    </fieldset>
+
+</form>
+
+<script>
+    var ChromeSamples = {
+        log: function () {
+
+            var line = Array.prototype.slice.call(arguments).map(function (argument) {
+                return typeof argument === 'string' ? argument : JSON.stringify(argument);
+            }).join(' ');
+
+            document.querySelector('#log').textContent += line + '\n';
+            const elem = document.getElementById('log');
+            elem.scrollTop = elem.scrollHeight;
+        },
+
+        clearLog: function () {
+            document.querySelector('#log').textContent = '';
+        },
+
+        setStatus: function (status) {
+            document.querySelector('#status').textContent = status;
+        },
+
+        setContent: function (newContent) {
+            var content = document.querySelector('#content');
+            while (content.hasChildNodes()) {
+                content.removeChild(content.lastChild);
+            }
+            content.appendChild(newContent);
+        }
+
+    };
+</script>
+
+<h3>Live Output</h3>
+<div id="output" class="output">
+    <div id="content"></div>
+    <div id="status"></div>
+    <pre id="log"></pre>
+</div>
+
+
+<script>
+    if (/Chrome\/(\d+\.\d+.\d+.\d+)/.test(navigator.userAgent)) {
+        // Let's log a warning if the sample is not supposed to execute on this
+        // version of Chrome.
+        if (55 > parseInt(RegExp.$1)) {
+            ChromeSamples.setStatus('Warning! Keep in mind this sample has been tested with Chrome ' + 55 + '.');
+        }
+    }
+</script>
+
+
+<script>
+
+    /**
+     * Device Name Pattern: "^BSDQ-|^LOCK"
+     * Supports: Battery Service
+     *
+     * Handshake Protocol:
+     * !LEGACY - Generate 4 byte ramdom checkdata (1 to 199 each)
+     * !LEGACY - Subscribe to CHECKDATA_SERVICE:CHECKDATA_CHARACTERISTIC_NOTIFY: sendCheckdataResponse and verify the response against the local checkdata
+     * !LEGACY - Write CHECKDATA_SERVICE:CHECKDATA_CHARACTERISTIC_WRITE:sendCheckdata
+     *
+     * - Pick a private aes session key, 16 byte, each byte between 1 to 90
+     * - Subscribe to DATA_NOTIFICATION_SERVICE:DATA_NOTIFICATION_CHARACTERISTIC
+     * - Write your session key via DATA_WRITE_SERVICE:DATA_WRITE_CHARACTERISTIC:setAesKey
+     * - Wait for DATA_NOTIFICATION_SERVICE:DATA_NOTIFICATION_CHARACTERISTIC:setAesKeyResponse or fail
+     *
+     * - Write the password via DATA_NOTIFICATION_SERVICE:DATA_NOTIFICATION_CHARACTERISTIC:sendPassword
+     * - Wait for DATA_NOTIFICATION_SERVICE:DATA_NOTIFICATION_CHARACTERISTIC:sendPasswordResponse or fail
+     * - Write DATA_NOTIFICATION_SERVICE:DATA_NOTIFICATION_CHARACTERISTIC:getData
+     * - Perform writes at will
+     *
+     */
+
+    /** AES Symmetric key (initial value), always 16 byte, may change
+     *
+     * static String MOD = "AES/ECB/PKCS5Padding";
+     * OR
+     * static String MOD = "AES/ECB/NoPadding";
+     */
+    const SECRET_APP_KEY = new Int8Array([-48, -7, -12, -116, 89, -94, 105, 29, 32, 83, -53, -38, -128, -124, 67, -109]).buffer;
+
+
+    /**
+     * Notify:
+     * - changepasswordResponse: {88, updateSuccess?240:_, _, -107}
+     * - sendPasswordResponse: {89, pwdIsCorrect?-16:_ , ignore(1), -107 }
+     * - devicePasswordUpdateResponse: {96, updateSuccess? 240: _, _, -107}
+     * - isAutoOrOpenChanged: {97, isAuto?240:_, isOpen? 240:_ , ignore(1),-107}
+     * - openStateChanged: {98, isOpen?15:-16, ignore(2),-107}
+     * - setAesKeyResponse: {-7, AES-ECB-PKCS5Padding(SECRET_APP_KEY, bytes(16).as("sessionKey")) ,-8}  // you should validate that
+     */
+    const DATA_NOTIFICATION_CHARACTERISTIC = "0000ffd4-0000-1000-8000-00805f9b34fb";
+    const DATA_NOTIFICATION_SERVICE = "0000ffd0-0000-1000-8000-00805f9b34fb";
+
+    /**
+     * WRITE
+     * - getdata: new byte[]{102, -16, 0, 119}
+     * - open: byte[]{-2, 79, 80, 69, 78, 0, 0, 0, -16, -3};
+     * - close: byte[]{-2, 67, 76, 79, 83, 69, 0, 0, -16, -3};
+     * - openForcible: byte[]{-2, 79, 80, 69, 78, 0, 0, 0, 0, -3};
+     * - closeForcible: byte[]{-2, 67, 76, 79, 83, 69, 0, 0, 0, -3};
+     * - sendPassword:  {41, uint8.times(6).as('password'), 40 } // password is 6 digits
+     * - changePassword: {40, uint8.times(6).as('oldPassword'), uint8.times(6).as('newPassword'), 41}; // password is 6 digits
+     * - changeMechanicalCode: {-1 ~ uint8.times(6).as('oldPassword'), uint8.times(6).as('newPassword'), -2}; // 1:top 2:left 3:bottom 4:right
+     * - setParams: { -3 ~  (isAutoClose? (byte)-16 : 15)  ~ uint8.as('closeTime') , 0, 0, -4 }
+     * - setAutoOpen: {-3, isAutoOpen?-16:15, 0, 0, 0, -4}
+     * - setAesKey: {-53, uint8.times(16).as('sessionKey') -54}
+     */
+    const DATA_WRITE_CHARACTERISTIC = "0000ffd9-0000-1000-8000-00805f9b34fb";
+    const DATA_WRITE_SERVICE = "0000ffd5-0000-1000-8000-00805f9b34fb";
+
+    /**
+     * After connect directly subscribe to this characteristic!
+     * When it returns, make sure contained checkdata equals your _unencrypted_ checkdata
+     * Notify:
+     * - sendCheckdataResponse { 102, bytes(4).as("checkdata"), ignore(12), 187 } after checkdata write - if it equals your checkdata, session is established
+     */
+    const CHECKDATA_CHARACTERISTIC_NOTIFY = "0000fff4-0000-1000-8000-00805f9b34fb";
+
+    /**
+     * After Subscribing to {@link DeviceUUID#CHECKDATA_CHARACTERISTIC_NOTIFY} successfully you should
+     * WRITE
+     * - sendCheckdata: {-86, AES-ECB-PKCS5Padding(SECRET_APP_KEY, bytes(4).as("checkdata")), 28, -21, 15, -7, 68, 73, 118, 53, -42, 123, 64, 4, 85};
+     *
+     * This roundtrip seem to ensure that we are connected to a compatible device with the same shared secret
+     */
+    const CHECKDATA_CHARACTERISTIC_WRITE = "0000fff5-0000-1000-8000-00805f9b34fb";
+    const CHECKDATA_SERVICE = "0000fff0-0000-1000-8000-00805f9b34fb";
+
+
+    document.querySelector('button#pair').addEventListener('click', () => {
+        if (isWebBluetoothEnabled()) {
+            ChromeSamples.clearLog();
+            onButtonClick();
+        }
+    });
+
+
+    /**
+     * @param {ArrayBuffer} data
+     * @return {ArrayBuffer}
+     **/
+    function encryptWithAppKey(data) {
+        const aesEcb = new aesjs.ModeOfOperation.ecb(new Uint8Array(SECRET_APP_KEY));
+        return aesEcb.encrypt(new Uint8Array(data));
+    }
+
+    /**
+     * @param {ArrayBuffer} sessionKey
+     * @return ArrayBuffer
+     */
+    function setAesKey(sessionKey) {
+        return new Int8Array([-53, ...new Int8Array(sessionKey), -54]).buffer;
+    }
+
+    /**
+     * @param {number[]} password - Array of 6 digits
+     * @return ArrayBuffer
+     **/
+    function sendPassword(password) {
+        return new Int8Array([41, ...password.slice(0, 6), 40]).buffer;
+    }
+
+    /**
+     * @return ArrayBuffer
+     **/
+    function getData() {
+        return new Int8Array([102, -16, 0, 119]).buffer;
+    }
+
+    /**
+     * @param {boolean} open
+     * @return ArrayBuffer
+     **/
+    function open() {
+        return new Int8Array([-2, 79, 80, 69, 78, 0, 0, 0, -16, -3]).buffer;
+    }
+
+    /**
+     * @param {boolean} autoOpenWhenConnected
+     * @param {number} duration TBD what does this do?
+     **/
+    function setAutoOpenWhenConnected(autoOpenWhenConnected, duration) {
+        return new Int8Array([-3, autoOpenWhenConnected ? -16 : 15, 0, 0, 0, -4]).buffer;
+    }
+
+    /**
+     * @param {boolean} open
+     * @return ArrayBuffer
+     **/
+    function close() {
+        return new Int8Array([-2, 67, 76, 79, 83, 69, 0, 0, -16, -3]).buffer;
+    }
+
+    /**
+     * @param {ArrayBuffer} buffer1
+     * @param {ArrayBuffer} buffer2
+     * @return {boolean}
+     */
+    function buffersEqual(buffer1, buffer2) {
+        const first = new Uint8Array(buffer1);
+        const second = new Uint8Array(buffer2)
+        return first.length === second.length && first.every((value, index) => value === second[index]);
+
+    }
+
+    function exponentialBackoff(max, delay, toTry, success, fail) {
+        return toTry().then(result => success(result))
+            .catch(_ => {
+                if (max === 0) {
+                    return fail();
+                }
+                time('Retrying in ' + delay + 's... (' + max + ' tries left)');
+                setTimeout(function () {
+                    exponentialBackoff(--max, delay * 2, toTry, success, fail);
+                }, delay * 1000);
+            });
+    }
+
+    function time(text) {
+        log('[' + new Date().toJSON().substr(11, 8) + '] ' + text);
+    }
+
+    async function onButtonClick() {
+        try {
+            log('Requesting Bluetooth Device...');
+            const device = await navigator.bluetooth.requestDevice({
+                /*filters: [
+                    {namePrefix: 'LOCK',},
+                    {namePrefix: 'BSDQ-',}],*/
+                acceptAllDevices: true,
+                optionalServices: [DATA_NOTIFICATION_SERVICE, DATA_WRITE_SERVICE, CHECKDATA_SERVICE]
+            });
+
+
+            function connect() {
+                log('Reconnecting to Bluetooth Device... ');
+                return device.gatt.connect().then((s) => {
+                    log("Connected successfully...");
+                    return s;
+                });
+            }
+
+
+            log('Connecting to GATT Server...');
+            let server = await connect();
+
+            function onDisconnected() {
+                log('> Bluetooth Device disconnected');
+                setTimeout(function () {
+                    connect();
+                }, 1000);
+
+            }
+
+            device.addEventListener('gattserverdisconnected', onDisconnected);
+
+
+            log('Getting Data Notification Service...');
+            const dataNotificationService = await server.getPrimaryService(DATA_NOTIFICATION_SERVICE);
+
+            log('Getting Data Write Service...');
+            const dataWriteService = await server.getPrimaryService(DATA_WRITE_SERVICE);
+
+            const aesKey = new Uint8Array(Array.from({length: 16}, () => Math.floor(Math.random() * 90) + 1)).buffer;
+            const aesKeyEncrypted = encryptWithAppKey(aesKey);
+            log(`Generated Session Key: ${new Int8Array(aesKey)}`)
+            log(`Encrypted Session Key: ${new Int8Array(aesKeyEncrypted)}`)
+
+            log('Getting DATA_NOTIFICATION_CHARACTERISTIC...');
+            const dataNotificationCharacteristic = await dataNotificationService.getCharacteristic(DATA_NOTIFICATION_CHARACTERISTIC);
+
+            log('Registering on DATA_NOTIFICATION_CHARACTERISTIC notifications...');
+
+            const onAesResponse = new Promise((resolve, reject) => {
+                dataNotificationCharacteristic.addEventListener('characteristicvaluechanged',
+                    (event) => {
+                        const data = new Int8Array(event.target.value.buffer);
+                        const expected = new Int8Array([-7, ...new Int8Array(aesKeyEncrypted), -8])
+                        if (buffersEqual(data.buffer, expected.buffer)) {
+                            resolve();
+                        } else {
+                            reject(`oh meh, expected ${expected} but got ${data}`)
+                        }
+                    }, {once: true});
+            });
+
+
+            await dataNotificationCharacteristic.startNotifications();
+
+            log('Getting DATA_WRITE_CHARACTERISTIC ...');
+            const dataWriteCharacteristic = await dataWriteService.getCharacteristic(DATA_WRITE_CHARACTERISTIC);
+            log('Writing DATA_WRITE_CHARACTERISTIC:setAesKey ...');
+            await dataWriteCharacteristic.writeValue(setAesKey(aesKey));
+
+            await onAesResponse;
+            log('Session Key handshake successful!');
+
+
+            const onPasswordResponse = new Promise((resolve, reject) => {
+                dataNotificationCharacteristic.addEventListener('characteristicvaluechanged',
+                    (event) => {
+                        const data = new Int8Array(event.target.value.buffer);
+                        const expected = new Int8Array([89, -16, 0, -107])
+                        if (buffersEqual(data.buffer, expected.buffer)) {
+                            resolve();
+                        } else {
+                            reject(`Looks like your password is WRONG! Expected ${expected} but got ${data}`)
+                        }
+                    }, {once: true});
+            });
+
+            const password = document.querySelector('#password').value.split('').map(c => parseInt(c));
+            log(`Sending password ${password}`)
+            await dataWriteCharacteristic.writeValue(sendPassword(password))
+            await onPasswordResponse;
+            log('Password handshake successful!');
+
+
+            dataNotificationCharacteristic.addEventListener('characteristicvaluechanged',
+                (event) => {
+                    const value = new Int8Array(event.target.value.buffer);
+                    if (value.length === 5 && value[0]===98 && value[4] === -107) {
+                        const isOpen = value[1] === 15;
+                        log(`> DATA_NOTIFICATION_CHARACTERISTIC: Lock is ${isOpen?'open':'closed'} (${new Int8Array(event.target.value.buffer)})`);
+                    } else {
+                        log(`> DATA_NOTIFICATION_CHARACTERISTIC: ${new Int8Array(event.target.value.buffer)}`);
+                    }
+
+                },);
+            await dataWriteCharacteristic.writeValue(getData())
+            document.getElementById('actionsFieldset').disabled = false;
+            document.getElementById('force_open').addEventListener('click', () => dataWriteCharacteristic.writeValue(open()))
+            document.getElementById('force_close').addEventListener('click', () => dataWriteCharacteristic.writeValue(close()))
+            document.getElementById('set_auto_open_true').addEventListener('click', () => dataWriteCharacteristic.writeValue(setAutoOpenWhenConnected(true, 0)))
+            document.getElementById('set_auto_open_false').addEventListener('click', () => dataWriteCharacteristic.writeValue(setAutoOpenWhenConnected(false, 0)))
+
+
+
+        } catch (error) {
+            log('Argh! ' + error);
+            throw error;
+        }
+    }
+</script>
+
+
+<script>
+    log = ChromeSamples.log;
+
+
+    function isWebBluetoothEnabled() {
+        if (navigator.bluetooth) {
+            return true;
+        } else {
+            ChromeSamples.setStatus('Web Bluetooth API is not available.\n' +
+                'Please make sure the "Experimental Web Platform features" flag is enabled.');
+            return false;
+        }
+    }
+</script>
+
